@@ -2,543 +2,383 @@ import streamlit as st
 import pandas as pd
 import io
 import csv
-import re
 from typing import List, Dict, Tuple
+import re
+
+
+# --- UNCHANGED HELPER FUNCTIONS ---
+def preprocess_csv_content(csv_content: str) -> str:
+    lines = csv_content.splitlines()
+    processed_lines = []
+    new_doc_entry_marker_pattern = r'(?<!^)([0-9a-zA-Z._-]+?\.pdf)"?,\d+,'
+    if not lines: return ""
+    if len(lines) > 0:
+        processed_lines.append(lines[0])
+        data_lines = lines[1:]
+    else:
+        data_lines = []
+    for line in data_lines:
+        if not line.strip(): continue
+        matches = list(re.finditer(new_doc_entry_marker_pattern, line))
+        if len(matches) > 0:
+            split_points = [0] + [m.start() for m in matches]
+            current_segment_start = 0
+            for sp in split_points[1:]:
+                segment = line[current_segment_start:sp].strip()
+                if segment: processed_lines.append(segment)
+                current_segment_start = sp
+            final_segment = line[current_segment_start:].strip()
+            if final_segment: processed_lines.append(final_segment)
+        else:
+            processed_lines.append(line)
+    return "\n".join(processed_lines)
 
 
 def parse_header(header_text: str) -> List[str]:
-    """Parse the expected header from input text"""
-    if not header_text.strip():
-        return []
-
-    # Handle both comma-separated and newline-separated headers
+    if not header_text.strip(): return []
     if ',' in header_text:
-        # Use CSV reader to properly handle quoted strings with commas
         try:
-            csv_reader = csv.reader([header_text])
-            parsed_header = next(csv_reader)
-            return [col.strip().strip('"') for col in parsed_header]
+            return next(csv.reader([header_text]))
         except:
-            # Fallback to simple split if CSV parsing fails
             return [col.strip().strip('"') for col in header_text.split(',')]
     else:
         return [col.strip().strip('"') for col in header_text.split('\n') if col.strip()]
 
 
-def split_pdf_lines(raw_text: str) -> str:
-    """
-    Preprocess raw CSV text to ensure that each line contains only one PDF document.
-    Splits lines if more than one `.pdf`-like document name is detected.
-    """
-    lines = raw_text.strip().split('\n')
-    fixed_lines = []
-
-    for line in lines:
-        matches = list(re.finditer(r'[^,\s"]+\.pdf', line))  # Find all .pdf names
-        if len(matches) <= 1:
-            fixed_lines.append(line)
-        else:
-            # Split line by PDF positions
-            split_positions = [m.start() for m in matches]
-            segments = []
-            for i, pos in enumerate(split_positions):
-                segment = line[pos:] if i == len(split_positions) - 1 else line[pos:split_positions[i + 1]]
-                # Prepend previous text if it's not the first chunk
-                if i > 0:
-                    segment = line[split_positions[i - 1]:split_positions[i]] + segment
-                segments.append(segment.strip(', \n'))
-
-            fixed_lines.extend(segments)
-
-    return "\n".join(fixed_lines)
-
-
-def validate_csv_structure(csv_content: str, expected_header: List[str]) -> Tuple[List[List[str]], List[Dict]]:
-    """
-    Validate CSV content against expected header
-    Returns: (valid_rows, faulty_rows_with_errors)
-    """
-    valid_rows = []
-    faulty_rows = []
-
-    # Parse CSV content
-    csv_reader = csv.reader(io.StringIO(csv_content))
-    rows = list(csv_reader)
-
-    if not rows:
-        return valid_rows, [{"line_number": 0, "content": "", "error": "Empty CSV content"}]
-
-    # Check header
-    actual_header = [col.strip() for col in rows[0]]
-    expected_header_clean = [col.strip() for col in expected_header]
-
-    if actual_header != expected_header_clean:
-        faulty_rows.append({
-            "line_number": 1,
-            "content": ",".join(rows[0]),
-            "error": f"Header mismatch. Expected: {expected_header_clean}, Got: {actual_header}"
-        })
+def validate_csv_structure(csv_content: str, expected_header: List[str], existing_doc_names: set) -> Tuple[
+    List[List[str]], List[Dict]]:
+    valid_rows, faulty_rows = [], []
+    processed_csv_content = preprocess_csv_content(csv_content)
+    try:
+        rows = list(csv.reader(io.StringIO(processed_csv_content)))
+    except csv.Error as e:
+        faulty_rows.append({"line_number": 0, "content": processed_csv_content, "error": f"CSV Parsing Error: {e}",
+                            "id": "parse_error"})
         return valid_rows, faulty_rows
-
-    # Validate data rows
-    expected_col_count = len(expected_header_clean)
-
-    for i, row in enumerate(rows[1:], start=2):  # Start from line 2 (after header)
+    if not rows: return valid_rows, faulty_rows
+    actual_header = [col.strip() for col in rows[0]]
+    if actual_header != expected_header:
+        faulty_rows.append(
+            {"line_number": 1, "content": ",".join(rows[0]), "error": f"Header mismatch", "id": "header_mismatch"})
+        return valid_rows, faulty_rows
+    expected_col_count = len(expected_header)
+    current_batch_doc_names = set()
+    for i, row in enumerate(rows[1:], start=2):
         row_content = ",".join(row)
-
-        # Skip rows that are just 'csv'
-        if row_content.strip().lower() == 'csv':
-            continue
-
-        # Check column count
+        if not row_content.strip(): continue
+        row_error, doc_name = None, ""
         if len(row) != expected_col_count:
-            faulty_rows.append({
-                "line_number": i,
-                "content": row_content,
-                "error": f"Column count mismatch. Expected {expected_col_count} columns, got {len(row)}"
-            })
-            continue
-
-        # Check for empty values (optional - you can modify this logic)
-        empty_cols = [j for j, cell in enumerate(row) if not cell.strip()]
-        if empty_cols:
-            col_names = [expected_header_clean[j] for j in empty_cols]
-            faulty_rows.append({
-                "line_number": i,
-                "content": row_content,
-                "error": f"Empty values in columns: {', '.join(col_names)}"
-            })
-            continue
-
-        # If all checks pass, add to valid rows
-        valid_rows.append(row)
-
+            row_error = f"Column count mismatch. Expected {expected_col_count}, got {len(row)}."
+        else:
+            empty_cols = [expected_header[j] for j, cell in enumerate(row) if not cell.strip()]
+            if empty_cols:
+                row_error = f"Empty values in columns: {', '.join(empty_cols)}."
+            else:
+                doc_name = row[0].strip().strip('"')
+                if doc_name in existing_doc_names or doc_name in current_batch_doc_names:
+                    row_error = f"Duplicate document name found: '{doc_name}'."
+                else:
+                    current_batch_doc_names.add(doc_name)
+        if row_error:
+            faulty_rows.append(
+                {"line_number": i, "content": row_content, "error": row_error, "id": f"faulty_{i}_{row_content}"})
+        else:
+            valid_rows.append(row)
+            if doc_name: existing_doc_names.add(doc_name)
     return valid_rows, faulty_rows
 
 
-def create_combined_csv(header: List[str], valid_rows: List[List[str]], faulty_rows: List[Dict]) -> str:
-    """Create combined CSV content with valid data and faulty rows marked"""
-    output = io.StringIO()
-    writer = csv.writer(output)
-
-    # Write header with additional error column
-    extended_header = header + ['ERROR_DESCRIPTION']
-    writer.writerow(extended_header)
-
-    # Write valid rows (with empty error column)
-    for row in valid_rows:
-        writer.writerow(row + [''])
-
-    # Write faulty rows with error descriptions
-    for faulty_row in faulty_rows:
-        # Parse the original content to get individual columns
-        try:
-            row_data = list(csv.reader([faulty_row['content']]))[0]
-            # Pad or truncate to match header length
-            while len(row_data) < len(header):
-                row_data.append('')
-            row_data = row_data[:len(header)]
-            writer.writerow(row_data + [faulty_row['error']])
-        except:
-            # If parsing fails, just add the raw content
-            writer.writerow([''] * len(header) + [f"Line {faulty_row['line_number']}: {faulty_row['error']}"])
-
-    return output.getvalue()
-
-
 def create_download_csv(header: List[str], valid_rows: List[List[str]]) -> str:
-    """Create CSV content for download"""
     output = io.StringIO()
     writer = csv.writer(output)
-
-    # Write header
     writer.writerow(header)
-
-    # Write valid rows
-    for row in valid_rows:
-        writer.writerow(row)
-
+    writer.writerows(valid_rows)
     return output.getvalue()
 
 
 def main():
-    st.set_page_config(page_title="CSV Header Validator", layout="wide")
+    st.set_page_config(page_title="CSV Validator Pro", layout="wide")
+    st.title("📊 CSV Validator Pro")
+    st.markdown("A better way to validate, fix, and process your CSV data.")
 
-    st.title("📊 CSV Header Validator and Processor")
-    st.markdown("Upload or paste CSV data to validate against a predefined header structure.")
+    # --- Initialize Session State ---
+    if 'expected_header' not in st.session_state: st.session_state['expected_header'] = []
+    if 'existing_doc_names' not in st.session_state: st.session_state['existing_doc_names'] = set()
+    if 'combined_valid_rows' not in st.session_state: st.session_state['combined_valid_rows'] = []
+    if 'combined_faulty_rows' not in st.session_state: st.session_state['combined_faulty_rows'] = []
+    if 'ignored_rows' not in st.session_state: st.session_state['ignored_rows'] = []
 
-    # Header input on main page
-    st.header("Expected CSV Header")
-    st.markdown("Enter the expected column headers (comma-separated or one per line):")
+    # --- Callback functions to handle data processing ---
+    def process_data_content(csv_content):
+        """Generic function to process any CSV content."""
+        if not csv_content:
+            return
 
-    expected_header_input = st.text_area(
-        "Header columns:",
-        placeholder="name,email,age,city\nor\nname\nemail\nage\ncity",
-        height=100,
-        key="header_input"
-    )
-
-    # Button to set header
-    header_submitted = st.button("Set Header", type="primary", help="Click to set the expected header structure")
-
-    expected_header = []
-    if header_submitted and expected_header_input.strip():
-        expected_header = parse_header(expected_header_input)
-        st.session_state['expected_header'] = expected_header
-
-    # Use session state to persist header
-    if 'expected_header' in st.session_state:
-        expected_header = st.session_state['expected_header']
-
-    if expected_header:
-        st.success(f"Expected columns ({len(expected_header)}): {', '.join(expected_header)}")
-    else:
-        st.warning("Please enter and set the expected header structure")
-
-    # Main content area
-    if expected_header:
-        st.header("CSV Data Input")
-
-        # Show both input methods side by side
-        col1, col2 = st.columns(2)
-
-        csv_content = ""
-
-        with col1:
-            st.subheader("📝 Paste CSV Text")
-            csv_text = st.text_area(
-                "CSV Content:",
-                placeholder="name,email,age,city\nJohn Doe,john@email.com,30,New York\nJane Smith,jane@email.com,25,Los Angeles",
-                height=250,
-                key="csv_text_input"
+        with st.spinner("Validating..."):
+            valid, faulty = validate_csv_structure(
+                csv_content,
+                st.session_state.expected_header,
+                st.session_state.existing_doc_names
             )
-            text_submitted = st.button("Process Pasted CSV", type="primary", key="process_text")
+            # Use sets to avoid adding exact duplicate rows
+            existing_valid_rows_tuples = {tuple(r) for r in st.session_state.combined_valid_rows}
+            for r in valid:
+                if tuple(r) not in existing_valid_rows_tuples:
+                    st.session_state.combined_valid_rows.append(r)
 
-            if text_submitted and csv_text.strip():
-                csv_content = csv_text
-                st.session_state['csv_content'] = csv_content
-                st.session_state['input_method'] = 'text'
+            existing_faulty_ids = {r['id'] for r in st.session_state.combined_faulty_rows}
+            for r in faulty:
+                if r['id'] not in existing_faulty_ids:
+                    st.session_state.combined_faulty_rows.append(r)
 
-        with col2:
-            st.subheader("📁 Upload CSV File")
-            uploaded_file = st.file_uploader(
-                "Choose a CSV file",
-                type=['csv'],
-                help="Upload a CSV file to validate",
-                key="file_uploader"
-            )
+            st.toast(f"Processing complete. Found {len(valid)} new valid and {len(faulty)} new faulty rows.", icon="🎉")
 
-            # Add some spacing to match the text area height
-            st.write("")
-            st.write("")
-            st.write("")
-            st.write("")
-            st.write("")
+    def process_pasted_text_callback():
+        """Callback for the 'Process Pasted CSV' button."""
+        csv_content = st.session_state.get("csv_text_input", "")
+        process_data_content(csv_content)
+        st.session_state.csv_text_input = ""  # Clear the input field
 
-            file_submitted = st.button("Process Uploaded CSV", type="primary", key="process_file")
+    def process_uploaded_file_callback():
+        """Callback for when a file is uploaded."""
+        uploaded_file = st.session_state.get("file_uploader")
+        if uploaded_file:
+            csv_content = uploaded_file.read().decode('utf-8')
+            process_data_content(csv_content)
 
-            if file_submitted and uploaded_file is not None:
-                try:
-                    csv_content = uploaded_file.read().decode('utf-8')
-                    st.session_state['csv_content'] = csv_content
-                    st.session_state['input_method'] = 'file'
-                    st.session_state['filename'] = uploaded_file.name
-                    st.success(f"File '{uploaded_file.name}' processed successfully!")
-
-                except Exception as e:
-                    st.error(f"Error reading file: {str(e)}")
-
-        # Use session state to get CSV content
-        if 'csv_content' in st.session_state:
-            csv_content = st.session_state['csv_content']
-
-        # Process CSV if content is available
-        if csv_content.strip():
-            st.header("🔍 Validation Results")
-
-            with st.spinner("Validating CSV structure..."):
-                cleaned_csv_content = split_pdf_lines(csv_content)
-                valid_rows, faulty_rows = validate_csv_structure(cleaned_csv_content, expected_header)
-
-                # Combine with existing data if any
-                if 'combined_valid_rows' not in st.session_state:
-                    st.session_state['combined_valid_rows'] = []
-                if 'combined_faulty_rows' not in st.session_state:
-                    st.session_state['combined_faulty_rows'] = []
-
-                # Add new valid rows to combined data
-                st.session_state['combined_valid_rows'].extend(valid_rows)
-
-                # Add new faulty rows to combined data (with updated line numbers)
-                line_offset = len(st.session_state['combined_valid_rows']) + len(
-                    st.session_state['combined_faulty_rows'])
-                for faulty_row in faulty_rows:
-                    faulty_row_copy = faulty_row.copy()
-                    faulty_row_copy['original_line_number'] = faulty_row_copy['line_number']
-                    faulty_row_copy['line_number'] = line_offset + faulty_row_copy['line_number']
-                    st.session_state['combined_faulty_rows'].append(faulty_row_copy)
-
-                # Update session state with current totals
-                st.session_state['valid_rows'] = st.session_state['combined_valid_rows']
-                st.session_state['faulty_rows'] = st.session_state['combined_faulty_rows']
-
-            # Get combined totals
-            total_valid = len(st.session_state['combined_valid_rows'])
-            total_faulty = len(st.session_state['combined_faulty_rows'])
-
-            # Display results
-            col1, col2, col3, col4 = st.columns(4)
-
-            with col1:
-                st.metric("New Valid", len(valid_rows))
-
-            with col2:
-                st.metric("New Faulty", len(faulty_rows))
-
-            with col3:
-                st.metric("Total Valid", total_valid)
-
-            with col4:
-                st.metric("Total Faulty", total_faulty)
-
-            # Clear data button
-            if st.button("🗑️ Clear All Data", help="Clear all combined data and start fresh"):
-                st.session_state['combined_valid_rows'] = []
-                st.session_state['combined_faulty_rows'] = []
-                st.session_state['valid_rows'] = []
-                st.session_state['faulty_rows'] = []
+    # --- Header Input ---
+    with st.expander("1. Define Expected CSV Header", expanded=not st.session_state.expected_header):
+        expected_header_input = st.text_area(
+            "Header columns (comma-separated or one per line): doc_name,number,description,country,research_focus",
+            height=100, key="header_input"
+        )
+        if st.button("Set Header", type="primary"):
+            header = parse_header(expected_header_input)
+            if header:
+                st.session_state.expected_header = header
+                st.session_state.existing_doc_names = set()
+                st.session_state.combined_valid_rows = []
+                st.session_state.combined_faulty_rows = []
+                st.session_state.ignored_rows = []
                 st.rerun()
-
-            # Show faulty rows with editing capability
-            if total_faulty > 0:
-                st.subheader("❌ Faulty Rows - Edit and Fix")
-                st.markdown("Edit the faulty rows below and click 'Fix Selected Rows' to validate them:")
-
-                # Create editable form for faulty rows
-                with st.form("edit_faulty_rows"):
-                    edited_rows = []
-                    rows_to_fix = []
-
-                    for i, faulty_row in enumerate(st.session_state['combined_faulty_rows']):
-                        col1, col2, col3 = st.columns([1, 3, 1])
-
-                        with col1:
-                            fix_this_row = st.checkbox(f"Fix", key=f"fix_{i}",
-                                                       help=f"Check to fix line {faulty_row['line_number']}")
-
-                        with col2:
-                            edited_content = st.text_input(
-                                f"Line {faulty_row['line_number']}:",
-                                value=faulty_row['content'],
-                                key=f"edit_{i}",
-                                help=f"Error: {faulty_row['error']}"
-                            )
-                            st.caption(f"❌ {faulty_row['error']}")
-
-                        with col3:
-                            st.metric("Line", faulty_row['line_number'])
-
-                        if fix_this_row:
-                            edited_rows.append({
-                                'index': i,
-                                'content': edited_content,
-                                'original': faulty_row
-                            })
-                            rows_to_fix.append(i)
-
-                    # Submit button for fixing rows
-                    fix_submitted = st.form_submit_button("🔧 Fix Selected Rows", type="primary")
-
-                    if fix_submitted and edited_rows:
-                        # Validate edited rows
-                        newly_valid = []
-                        still_faulty = []
-
-                        for edited_row in edited_rows:
-                            # Create a mini CSV to validate
-                            mini_csv = ",".join(expected_header) + "\n" + edited_row['content']
-                            valid, faulty = validate_csv_structure(mini_csv, expected_header)
-
-                            if valid and len(valid) > 0:
-                                newly_valid.extend(valid)
-                                st.success(f"✅ Fixed line {edited_row['original']['line_number']}")
-                            else:
-                                # Keep as faulty with updated content
-                                updated_faulty = edited_row['original'].copy()
-                                updated_faulty['content'] = edited_row['content']
-                                if faulty and len(faulty) > 0:
-                                    updated_faulty['error'] = faulty[0]['error']
-                                still_faulty.append(updated_faulty)
-                                st.error(f"❌ Line {edited_row['original']['line_number']} still has issues")
-
-                        # Update session state
-                        # Remove fixed rows from faulty list
-                        remaining_faulty = [row for i, row in enumerate(st.session_state['combined_faulty_rows']) if
-                                            i not in rows_to_fix]
-                        # Add still faulty rows back
-                        remaining_faulty.extend(still_faulty)
-
-                        # Update session state
-                        st.session_state['combined_faulty_rows'] = remaining_faulty
-                        st.session_state['combined_valid_rows'].extend(newly_valid)
-                        st.session_state['valid_rows'] = st.session_state['combined_valid_rows']
-                        st.session_state['faulty_rows'] = st.session_state['combined_faulty_rows']
-
-                        if newly_valid:
-                            st.success(f"🎉 Successfully fixed {len(newly_valid)} rows!")
-
-                        st.rerun()
-
-                # Show remaining faulty rows in a table
-                if st.session_state['combined_faulty_rows']:
-                    st.subheader("📋 Remaining Faulty Rows Summary")
-                    faulty_df = pd.DataFrame(st.session_state['combined_faulty_rows'])
-                    st.dataframe(
-                        faulty_df[['line_number', 'content', 'error']],
-                        use_container_width=True,
-                        column_config={
-                            "line_number": "Line #",
-                            "content": "Row Content",
-                            "error": "Error Description"
-                        }
-                    )
             else:
-                st.success("✅ All rows are valid!")
+                st.error("Header cannot be empty.")
 
-            # Show valid data preview
-            if total_valid > 0:
-                st.subheader("✅ Combined Valid Data Preview")
+    if not st.session_state.expected_header:
+        st.warning("Please set the expected header to begin validation.")
+        st.stop()
 
-                # Create DataFrame for valid data
-                valid_df = pd.DataFrame(st.session_state['combined_valid_rows'], columns=expected_header)
-                st.dataframe(valid_df, use_container_width=True)
+    st.success(f"**Expected Header:** `{'`, `'.join(st.session_state.expected_header)}`")
 
-                # Download buttons for clean CSV
-                col1, col2, col3 = st.columns(3)
+    # --- CSV Data Input with Callbacks ---
 
-                with col1:
-                    clean_csv = create_download_csv(expected_header, st.session_state['combined_valid_rows'])
-                    st.download_button(
-                        label="📥 Download Clean CSV",
-                        data=clean_csv,
-                        file_name="validated_data.csv",
-                        mime="text/csv",
-                        help="Download the validated CSV with only valid rows"
-                    )
+    st.header("2. Add CSV Data")
+    col1, col2 = st.columns(2)
 
-                with col2:
-                    # Combined CSV with all data (valid + faulty marked)
-                    combined_csv = create_combined_csv(expected_header, st.session_state['combined_valid_rows'],
-                                                       st.session_state['combined_faulty_rows'])
-                    st.download_button(
-                        label="📥 Download Combined CSV",
-                        data=combined_csv,
-                        file_name="combined_data.csv",
-                        mime="text/csv",
-                        help="Download CSV with valid data and faulty rows marked with error descriptions"
-                    )
+    with col1:
+        with st.container():
+            st.markdown(
+                """
+                <div style="border: 2px solid #ccc; padding: 10px; border-radius: 10px;">
+                """,
+                unsafe_allow_html=True
+            )
 
-                with col3:
-                    # Faulty rows report
-                    if st.session_state['combined_faulty_rows']:
-                        faulty_df = pd.DataFrame(st.session_state['combined_faulty_rows'])
-                        faulty_csv = faulty_df.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download Faulty Report",
-                            data=faulty_csv,
-                            file_name="faulty_rows_report.csv",
-                            mime="text/csv",
-                            help="Download a report of all faulty rows with error descriptions"
-                        )
+            st.file_uploader(
+                "Upload a CSV file (processes automatically)",
+                type=['csv'],
+                key="file_uploader",
+                on_change=process_uploaded_file_callback
+            )
 
-                # Show statistics
-                with st.expander("📊 Data Statistics"):
-                    total_rows = total_valid + total_faulty
-                    st.write(f"**Total rows processed:** {total_rows}")
-                    st.write(f"**Valid rows:** {total_valid}")
-                    st.write(f"**Faulty rows:** {total_faulty}")
-                    if total_rows > 0:
-                        success_rate = (total_valid / total_rows) * 100
-                        st.write(f"**Success rate:** {success_rate:.1f}%")
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    else:
-        st.info("Please define the expected CSV header structure above to begin validation.")
+    with col2:
+        with st.container():
+            st.markdown(
+                """
+                <div style="border: 2px solid #ccc; padding: 10px; border-radius: 10px;">
+                """,
+                unsafe_allow_html=True
+            )
 
-    # Always show current combined CSV at the bottom if data exists
-    if 'combined_valid_rows' in st.session_state and 'expected_header' in st.session_state:
-        st.markdown("---")
-        st.header("📋 Current Combined CSV Preview")
+            st.text_area("Or paste CSV text", height=160, key="csv_text_input")
+            st.button(
+                "Process Pasted CSV",
+                on_click=process_pasted_text_callback,
+                type="primary"
+            )
 
-        valid_rows = st.session_state.get('combined_valid_rows', [])
-        faulty_rows = st.session_state.get('combined_faulty_rows', [])
-        expected_header = st.session_state.get('expected_header', [])
+            st.markdown("</div>", unsafe_allow_html=True)
 
-        if valid_rows or faulty_rows:
-            # Create combined preview
-            all_data = []
-            status_column = []
+    # --- Display Metrics ---
+    st.header("3. Review Results")
+    v_col, f_col, i_col = st.columns(3)
+    v_col.metric("✅ Total Valid Rows", len(st.session_state.combined_valid_rows))
+    f_col.metric("❌ Total Faulty Rows", len(st.session_state.combined_faulty_rows))
+    i_col.metric("🙈 Total Ignored Rows", len(st.session_state.ignored_rows))
 
-            # Add valid rows
-            for row in valid_rows:
-                all_data.append(row)
-                status_column.append('✅ Valid')
+    # --- Faulty Row Handling ---
+    if st.session_state.combined_faulty_rows:
+        st.subheader("Action Required: Fix or Ignore Faulty Rows")
+        st.markdown(
+            "Edit rows directly in the table, then click **Re-Validate**. Or, click **Ignore** to remove them from this list.")
 
-            # Add faulty rows
-            for faulty_row in faulty_rows:
-                try:
-                    row_data = list(csv.reader([faulty_row['content']]))[0]
-                    while len(row_data) < len(expected_header):
-                        row_data.append('')
-                    row_data = row_data[:len(expected_header)]
-                    all_data.append(row_data)
-                    status_column.append(f"❌ {faulty_row['error']}")
-                except:
-                    all_data.append([''] * len(expected_header))
-                    status_column.append(f"❌ Line {faulty_row['line_number']}: {faulty_row['error']}")
+        # Callback for Re-Validate button
+        def revalidate_row_callback(faulty_row_id, edited_row_data):
+            # Find the actual faulty row by its ID
+            current_faulty_row = next(
+                (row for row in st.session_state.combined_faulty_rows if row['id'] == faulty_row_id), None)
 
-            # Create DataFrame safely
-            try:
-                if all_data:
-                    # Ensure all rows have the same number of columns
-                    max_cols = len(expected_header)
-                    normalized_data = []
-                    for row in all_data:
-                        if len(row) < max_cols:
-                            row.extend([''] * (max_cols - len(row)))
-                        elif len(row) > max_cols:
-                            row = row[:max_cols]
-                        normalized_data.append(row)
+            if not current_faulty_row:
+                st.warning("Error: Original faulty row not found. Page may have reloaded.", icon="⚠️")
+                st.rerun()  # Rerun to refresh the state
+                return
 
-                    # Create DataFrame with normalized data
-                    combined_df = pd.DataFrame(normalized_data, columns=expected_header)
-                    combined_df['Status'] = status_column
+            if not edited_row_data.empty:
+                edited_row_list = edited_row_data.iloc[0].tolist()
+                edited_row_str = ",".join(map(str, edited_row_list))
+                mini_csv = "\n".join([','.join(st.session_state.expected_header), edited_row_str])
 
-                    st.dataframe(combined_df, use_container_width=True)
+                # Temporarily remove the original doc_name associated with this faulty row
+                # from existing_doc_names for re-validation
+                original_doc_name = current_faulty_row['content'].split(',')[0].strip().strip('"')
+                if original_doc_name in st.session_state.existing_doc_names:
+                    # Only remove if it was actually part of existing_doc_names from a previously validated row
+                    # This prevents removing doc names that might be valid in other existing rows.
+                    st.session_state.existing_doc_names.discard(
+                        original_doc_name)  # Use discard as it doesn't raise error if not found
 
-                    # Quick download button
-                    combined_csv = create_combined_csv(expected_header, valid_rows, faulty_rows)
-                    st.download_button(
-                        label="📥 Quick Download Combined CSV",
-                        data=combined_csv,
-                        file_name="combined_data.csv",
-                        mime="text/csv",
-                        help="Download CSV with all data including error descriptions"
-                    )
+                valid, new_faulty = validate_csv_structure(
+                    mini_csv,
+                    st.session_state.expected_header,
+                    st.session_state.existing_doc_names  # Pass updated existing_doc_names
+                )
+
+                if valid:
+                    st.session_state.combined_valid_rows.extend(valid)
+                    # Remove the fixed row from faulty rows using a list comprehension
+                    st.session_state.combined_faulty_rows = [
+                        row for row in st.session_state.combined_faulty_rows if row['id'] != faulty_row_id
+                    ]
+                    st.toast("Row fixed and moved to valid data!", icon="✅")
+                    st.rerun()
                 else:
-                    st.info("No data to display")
-            except Exception as e:
-                st.error(f"Error displaying data: {str(e)}")
-                st.write("Raw data for debugging:")
-                st.write(f"Expected header length: {len(expected_header)}")
-                st.write(f"Valid rows: {len(valid_rows)}")
-                st.write(f"Faulty rows: {len(faulty_rows)}")
-                if all_data:
-                    st.write(f"Sample row lengths: {[len(row) for row in all_data[:3]]}")
+                    # Update the error message for the current faulty row
+                    current_faulty_row_index = next(
+                        (idx for idx, row in enumerate(st.session_state.combined_faulty_rows) if
+                         row['id'] == faulty_row_id), None)
+                    if current_faulty_row_index is not None and new_faulty:
+                        st.session_state.combined_faulty_rows[current_faulty_row_index]['error'] = new_faulty[0][
+                            'error']
+                    st.warning(f"Still faulty: {new_faulty[0]['error']}", icon="❌")
+                    # Re-add the original doc_name if it was removed and the row is still faulty
+                    if original_doc_name:
+                        st.session_state.existing_doc_names.add(original_doc_name)
 
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        "**Note:** This tool validates CSV structure, column count, and checks for empty values. You can modify the validation logic as needed.")
+        # Callback for Ignore button
+        def ignore_row_callback(faulty_row_id):
+            ignored_row_data = None
+            new_faulty_rows = []
+            for row in st.session_state.combined_faulty_rows:
+                if row['id'] == faulty_row_id:
+                    ignored_row_data = row
+                else:
+                    new_faulty_rows.append(row)
+
+            if ignored_row_data:
+                st.session_state.ignored_rows.append(ignored_row_data)
+                st.session_state.combined_faulty_rows = new_faulty_rows  # Update the list
+                st.toast(f"Row ignored.", icon="🙈")
+                st.rerun()  # Rerun after modification
+            else:
+                st.warning("Error: Row to ignore not found. Already processed?", icon="⚠️")
+                st.rerun()  # Rerun to refresh state
+
+        # Iterate directly over the session state list; callbacks will handle modification and reruns.
+        # However, if a button is pressed and triggers a rerun, the loop needs to be robust.
+        # The `KeyError: 0` implies that `combined_faulty_rows` might have been empty or
+        # the index was off after a rerun caused by a prior button press.
+        # We need to ensure that the list isn't being iterated while it's being modified
+        # by a callback on the *same* execution.
+        # Streamlit's rerunning mechanism makes this tricky.
+        # The best approach is often to have a flag or a temporary list to manage what needs to be removed/added
+        # and then apply these changes after the loop, as was previously attempted,
+        # but with proper re-initialization of the action list.
+        # Let's revert slightly but apply the `id` concept.
+
+        # New approach: Use a list to mark IDs for removal/processing and apply changes at the end of the loop.
+        # This prevents "KeyError" from pop() on an already changed list.
+        rows_to_remove_ids = set()
+        rows_to_add_to_valid = []
+
+        # We display each faulty row. Buttons for each row will trigger callbacks.
+        # The callbacks will update session state directly and cause a rerun.
+        # The problem is when one button is clicked, `st.rerun()` happens, the script restarts,
+        # and the loop tries to re-render potentially removed elements.
+
+        # Let's simplify the loop to just display, and let the callbacks handle the state changes completely.
+        # The `on_click` callbacks will manage `st.session_state` and `st.rerun()`.
+        # The `for` loop itself should not *assume* `combined_faulty_rows` remains static.
+
+        # A simple iteration is fine if callbacks trigger immediate reruns.
+        # The `KeyError: 0` on `original_doc_name` suggests the `faulty_row` itself
+        # passed to the callback might be stale, or the index is wrong.
+        # The `id` passing should fix this.
+
+        # Iterate over a copy to ensure stable iteration during button clicks
+        # when `st.rerun` might be triggered.
+        # The crucial part is that the `faulty_row` in the loop's current iteration
+        # should be the *exact* one we are trying to act on.
+        # This is where passing `faulty_row['id']` to the callback is powerful.
+
+        for faulty_row_item in list(st.session_state.combined_faulty_rows):  # Iterate over a copy
+            st.error(f"**Error in line ~{faulty_row_item['line_number']}**: {faulty_row_item['error']}", icon="❗️")
+            try:
+                parsed_content = next(csv.reader(io.StringIO(faulty_row_item['content'])))
+            except (StopIteration, csv.Error):
+                parsed_content = [faulty_row_item['content']]
+            num_cols = len(st.session_state.expected_header)
+            row_data = (parsed_content + [''] * num_cols)[:num_cols]
+            df_edit = pd.DataFrame([row_data], columns=st.session_state.expected_header)
+
+            # Key the data_editor with the faulty row's ID for persistence
+            # Use `f"editor_{faulty_row_item['id']}"` for unique keys
+            edited_df = st.data_editor(df_edit, key=f"editor_{faulty_row_item['id']}", num_rows="dynamic")
+
+            btn_col1, btn_col2, _ = st.columns([1, 1, 4])
+
+            # Pass the unique ID of the faulty row to the callback
+            btn_col1.button(
+                "🔧 Re-Validate",
+                key=f"fix_{faulty_row_item['id']}",
+                type="primary",
+                on_click=revalidate_row_callback,
+                args=(faulty_row_item['id'], edited_df)
+            )
+            btn_col2.button(
+                "🙈 Ignore",
+                key=f"ignore_{faulty_row_item['id']}",
+                on_click=ignore_row_callback,
+                args=(faulty_row_item['id'],)
+            )
+            st.divider()
+
+    # --- Final Data Display & Download ---
+    st.header("4. Final Data")
+    if st.session_state.combined_valid_rows:
+        with st.expander("✅ View Valid Data", expanded=True):
+            valid_df = pd.DataFrame(st.session_state.combined_valid_rows, columns=st.session_state.expected_header)
+            st.dataframe(valid_df, use_container_width=True)
+            st.download_button(label="⬇️ Download Clean CSV", data=create_download_csv(st.session_state.expected_header,
+                                                                                       st.session_state.combined_valid_rows),
+                               file_name="clean_data.csv", mime="text/csv", type="primary")
+    if st.session_state.ignored_rows:
+        with st.expander("🙈 View Ignored Rows"):
+            ignored_data_for_display = [
+                {"Original Line": r['line_number'], "Error": r['error'], "Original Content": r['content']} for r in
+                st.session_state.ignored_rows]
+            st.table(ignored_data_for_display)
 
 
 if __name__ == "__main__":
